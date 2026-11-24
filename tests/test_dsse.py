@@ -7,7 +7,10 @@ from pathlib import Path
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from securesystemslib.dsse import Envelope
-from securesystemslib.exceptions import VerificationError
+from securesystemslib.exceptions import (
+    UnverifiedSignatureError,
+    VerificationError,
+)
 from securesystemslib.signer import CryptoSigner, Signature
 
 PEMS_DIR = Path(__file__).parent / "data" / "pems"
@@ -176,6 +179,196 @@ class TestEnvelope(unittest.TestCase):
         duplicate_keys = key_list + key_list
         with self.assertRaises(VerificationError):
             envelope_obj.verify(duplicate_keys, 4)  # 3 unique keys, threshold 4.
+
+    def test_verify_rejects_non_dict_signatures(self):
+        """verify() must not trust an envelope whose signatures are not a
+        keyid -> Signature dict (e.g. a raw list, bypassing from_dict)."""
+        envelope_obj = Envelope.from_dict(copy.deepcopy(self.envelope_dict))
+        signature = next(iter(envelope_obj.signatures.values()))
+        dummy_key = self.signers[0].public_key
+
+        evil_envelope = Envelope(
+            envelope_obj.payload,
+            envelope_obj.payload_type,
+            [signature, signature],
+        )
+        with self.assertRaisesRegex(ValueError, "keyid to Signature"):
+            evil_envelope.verify([dummy_key], 1)
+
+    def test_verify_rejects_inconsistent_signature_keyid(self):
+        """A Signature whose own keyid does not match its mapping key must
+        never be accepted."""
+        envelope_obj = Envelope.from_dict(copy.deepcopy(self.envelope_dict))
+        signature = next(iter(envelope_obj.signatures.values()))
+
+        evil_envelope = Envelope(
+            envelope_obj.payload,
+            envelope_obj.payload_type,
+            {"some-other-keyid": signature},
+        )
+        dummy_key = self.signers[0].public_key
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            evil_envelope.verify([dummy_key], 1)
+
+    def test_verify_unknown_signer_cannot_reach_threshold(self):
+        """Signatures by unknown signers can never count towards the
+        threshold, even when they outnumber the trusted signatures."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+
+        # One legitimate signature, plus two signatures with unknown keyids.
+        envelope_obj.sign(self.signers[0])
+        unknown_sigs = {}
+        for i in range(2):
+            sig = self.signers[1].sign(envelope_obj.pae())
+            sig.keyid = f"unknown-signer-{i}"
+            unknown_sigs[sig.keyid] = sig
+        envelope_obj.signatures.update(unknown_sigs)
+
+        # Two trusted keys are provided, but only the first one has a
+        # matching signature in the envelope: the unknown signers must not
+        # fill the gap.
+        trusted_keys = [signer.public_key for signer in self.signers[:2]]
+
+        # Threshold 2 with only one trusted key must fail.
+        with self.assertRaises(VerificationError):
+            envelope_obj.verify(trusted_keys, 2)
+
+        # Threshold 1 with the trusted key must pass: unknown signers are
+        # simply ignored rather than counted.
+        accepted = envelope_obj.verify(trusted_keys, 1)
+        self.assertEqual(list(accepted), [trusted_keys[0].keyid])
+
+    def test_verify_duplicate_keyid_counts_only_once(self):
+        """A single trusted keyid can only count once, regardless of how
+        often it appears in the caller-provided key list."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+        envelope_obj.sign(self.signers[0])
+
+        key = self.signers[0].public_key
+        another_key = self.signers[1].public_key
+        with self.assertRaises(VerificationError):
+            envelope_obj.verify([key, key, key, another_key], 2)
+
+        accepted = envelope_obj.verify([key, key, key], 1)
+        self.assertEqual(list(accepted), [key.keyid])
+
+    def test_verify_requires_pae_and_signature_to_close(self):
+        """A valid signature only verifies against the envelope's own PAE:
+        tampering with payload or payload type breaks the closure."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+        envelope_obj.sign(self.signers[0])
+        key = self.signers[0].public_key
+
+        tampered_payload = Envelope(
+            b"tampered payload",
+            envelope_obj.payload_type,
+            copy.deepcopy(envelope_obj.signatures),
+        )
+        with self.assertRaises(VerificationError):
+            tampered_payload.verify([key], 1)
+
+        tampered_type = Envelope(
+            envelope_obj.payload,
+            "http://example.com/TamperedType",
+            copy.deepcopy(envelope_obj.signatures),
+        )
+        with self.assertRaises(VerificationError):
+            tampered_type.verify([key], 1)
+
+    def test_verify_failure_does_not_into_later_run(self):
+        """A failed verification leaves no state behind: the next run starts
+        fresh and an independently valid envelope still verifies."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+        envelope_obj.sign(self.signers[0])
+        key = self.signers[0].public_key
+        another_key = self.signers[1].public_key
+
+        # First run fails: threshold cannot be met with one signature.
+        with self.assertRaises(VerificationError):
+            envelope_obj.verify([key, another_key], 2)
+
+        # Second run with an achievable threshold succeeds independently.
+        accepted = envelope_obj.verify([key], 1)
+        self.assertEqual(list(accepted), [key.keyid])
+
+        # A failed run against tampered data must not poison a subsequent
+        # verification of the intact envelope.
+        tampered = Envelope(
+            b"tampered payload",
+            envelope_obj.payload_type,
+            copy.deepcopy(envelope_obj.signatures),
+        )
+        with self.assertRaises(VerificationError):
+            tampered.verify([key], 1)
+        accepted = envelope_obj.verify([key], 1)
+        self.assertEqual(list(accepted), [key.keyid])
+
+    def test_verify_valid_multi_signature_still_passes(self):
+        """Legitimate multi-signer envelopes at various thresholds verify."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+
+        key_list = []
+        for signer in self.signers:
+            envelope_obj.sign(signer)
+            key_list.append(signer.public_key)
+
+        for threshold in range(1, len(key_list) + 1):
+            accepted = envelope_obj.verify(key_list, threshold)
+            self.assertEqual(len(accepted), threshold)
+
+    def test_verify_key_that_raises_non_verification_error(self):
+        """A broken key implementation cannot make a signature count: only a
+        clean verification of PAE + signature value is accepted."""
+
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+        signature = envelope_obj.sign(self.signers[0])
+
+        class ExplodingKey:
+            keyid = signature.keyid
+
+            def verify_signature(self, sig, data):
+                raise UnverifiedSignatureError("never valid")
+
+        with self.assertRaises(VerificationError):
+            envelope_obj.verify([ExplodingKey()], 1)
+
+    def test_verify_contract_violating_key_does_not_crash_verification(self):
+        """If a Key implementation raises an exception outside the
+        UnverifiedSignatureError contract, public verification must treat it
+        as a failed signature rather than accepting it or leaking state."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+        signature = envelope_obj.sign(self.signers[0])
+        good_key = self.signers[0].public_key
+
+        class BadContractKey:
+            keyid = signature.keyid
+
+            def verify_signature(self, sig, data):
+                raise RuntimeError("broken key implementation")
+
+        # A non-contract exception counts as a failed signature, so the
+        # threshold cannot be reached with the broken implementation alone.
+        with self.assertRaises(VerificationError):
+            envelope_obj.verify([BadContractKey()], 1)
+
+        # A subsequent, independent run with the genuine key is unaffected:
+        # the previous failure leaves no state behind.
+        accepted = envelope_obj.verify([good_key], 1)
+        self.assertEqual(list(accepted), [good_key.keyid])
 
 
 # Run the unit tests.

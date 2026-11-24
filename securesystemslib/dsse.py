@@ -129,7 +129,9 @@ class Envelope:
             threshold: Number of signatures needed to pass the verification.
 
         Raises:
-            ValueError: If "threshold" is not valid.
+            ValueError: If "threshold" is not valid, or if the envelope
+                signatures are not represented as a dict of keyid to
+                Signature.
             VerificationError: If the enclosed signatures do not pass the
                 verification.
 
@@ -143,9 +145,6 @@ class Envelope:
             signature.
         """
 
-        accepted_keys = {}
-        pae = self.pae()
-
         # checks for threshold value.
         if threshold <= 0:
             raise ValueError("Threshold must be greater than 0")
@@ -153,25 +152,67 @@ class Envelope:
         if len(keys) < threshold:
             raise ValueError("Number of keys can't be less than threshold")
 
-        for signature in self.signatures.values():
-            for key in keys:
-                # If Signature keyid doesn't match with Key, skip.
-                if not key.keyid == signature.keyid:
-                    continue
+        # The envelope structure is part of the public API: refuse to verify
+        # anything that is not a mapping of keyid -> Signature. Without this
+        # check a malformed envelope (e.g. a list of signatures, or multiple
+        # signatures sharing a keyid) could be fed to verify() directly and
+        # bypass the duplicate-keyid protection in from_dict().
+        if not isinstance(self.signatures, dict) or not all(
+            isinstance(keyid, str) and isinstance(sig, Signature)
+            for keyid, sig in self.signatures.items()
+        ):
+            raise ValueError(
+                "Signatures must be a dict of keyid to Signature instances"
+            )
 
-                # If a key verifies the signature, we exit and use the result.
-                try:
-                    key.verify_signature(signature, pae)
-                    accepted_keys[key.keyid] = key
-                    break
-                except exceptions.UnverifiedSignatureError:
-                    continue
+        # Deduplicate trusted keys by keyid: one keyid can only ever count
+        # once towards the threshold, even if the caller passes it repeatedly.
+        trusted_keys: dict[str, Key] = {}
+        for key in keys:
+            trusted_keys.setdefault(key.keyid, key)
 
-            # Break, if amount of accepted_keys are more than threshold.
+        # Every verification run starts from a fresh state: results of a
+        # previous (possibly failed) verify() call are never inherited.
+        accepted_keys: dict[str, Key] = {}
+
+        # Recompute the PAE for this exact envelope on every run. A signature
+        # is only accepted if the signature value cryptographically closes over
+        # this PAE under a trusted key; the keyid match alone is never enough.
+        pae = self.pae()
+
+        for sig_keyid, signature in self.signatures.items():
+            # The mapping key and the Signature's own keyid must be consistent.
+            if sig_keyid != signature.keyid:
+                raise ValueError(
+                    f"Signature keyid '{signature.keyid}' does not match "
+                    f"the envelope mapping key '{sig_keyid}'"
+                )
+
+            # Signatures by unknown signers are ignored: they can never
+            # contribute to the threshold because no trusted key exists to
+            # close the PAE/signature pair.
+            key = trusted_keys.get(signature.keyid)
+            if key is None:
+                continue
+
+            # Accept only when PAE and signature value verify together.
+            try:
+                key.verify_signature(signature, pae)
+            except Exception:
+                # UnverifiedSignatureError is the documented failure signal;
+                # a custom Key that raises something else must never make a
+                # non-closed signature count either. The failure is confined
+                # to this (key, signature) pair and cannot leak into later
+                # iterations or later verify() runs.
+                continue
+
+            # Count each unique trusted keyid at most once.
+            accepted_keys[key.keyid] = key
+
             if len(accepted_keys) >= threshold:
                 break
 
-        if threshold > len(accepted_keys):
+        if len(accepted_keys) < threshold:
             raise exceptions.VerificationError(
                 "Accepted signatures do not match threshold,"
                 f" Found: {len(accepted_keys)}, Expected {threshold}"
