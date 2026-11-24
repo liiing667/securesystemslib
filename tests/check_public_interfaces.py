@@ -37,6 +37,7 @@ from securesystemslib.exceptions import (
     UnsupportedLibraryError,
     VerificationError,
 )
+from securesystemslib.signer._utils import compute_default_keyid
 
 # Import all Signers and Keys to ensure the import works without the actual libraries
 from securesystemslib.signer import (  # noqa: F401
@@ -108,12 +109,15 @@ class TestPublicInterfaces(unittest.TestCase):
 
     def test_signer_verify(self):
         """Assert generic VerificationError from UnsupportedLibraryError."""
-        keyid = "aa"
+        keyval = {"public": "val"}
+        # identity-bound keyid so the key passes the key identity check and
+        # reaches the crypto backend, which is unavailable in this env
+        keyid = compute_default_keyid("rsa", "rsa-pkcs1v15-sha512", keyval)
         sig = Signature(keyid, "aaaaaaaa", {"other_headers": "aaaaaa"})
 
         keys = [
             GPGKey(keyid, "rsa", "pgp+rsa-pkcsv1.5", {"public": "val"}),
-            SSlibKey(keyid, "rsa", "rsa-pkcs1v15-sha512", {"public": "val"}),
+            SSlibKey(keyid, "rsa", "rsa-pkcs1v15-sha512", keyval),
             SigstoreKey(
                 keyid,
                 "sigstore-oidc",
@@ -133,7 +137,10 @@ class TestPublicInterfaces(unittest.TestCase):
     def test_signer_ed25519_fallback(self):
         """Assert ed25519 signature verification works in pure Python."""
         data = b"The quick brown fox jumps over the lazy dog"
-        keyid = "aaa"
+        keyval = {
+            "public": "beb75c268206554e963c45dcbf3c004140d1cb69bbfe9370ef736f19388c9b26"
+        }
+        keyid = compute_default_keyid("ed25519", "ed25519", keyval)
         sig = Signature.from_dict(
             {
                 "keyid": keyid,
@@ -146,9 +153,7 @@ class TestPublicInterfaces(unittest.TestCase):
             {
                 "keytype": "ed25519",
                 "scheme": "ed25519",
-                "keyval": {
-                    "public": "beb75c268206554e963c45dcbf3c004140d1cb69bbfe9370ef736f19388c9b26"
-                },
+                "keyval": keyval,
             },
         )
 

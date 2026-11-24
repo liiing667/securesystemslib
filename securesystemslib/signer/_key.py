@@ -544,9 +544,27 @@ class SSlibKey(Key):
     def verify_signature(self, signature: Signature, data: bytes) -> None:
         try:
             if signature.keyid != self.keyid:
-                raise ValueError(
+                # A key may only verify signatures that claim its own keyid:
+                # a keyid mismatch means this is not the key the signature
+                # refers to, so it must never verify (and be cached/accepted
+                # as) another key.
+                raise VerificationError(
                     f"keyid mismatch: 'key id: {self.keyid}"
                     f" != signature keyid: {signature.keyid}'"
+                )
+
+            # The keyid is only a trustworthy identity if it is derived from
+            # the key content (keytype, scheme and public material). An
+            # arbitrary keyid does not bind this key object to the metadata
+            # keyid: refuse to verify in that case, so a mismatched key can
+            # never be treated as the same key.
+            expected_keyid = compute_default_keyid(
+                self.keytype, self.scheme, self.keyval
+            )
+            if self.keyid != expected_keyid:
+                raise VerificationError(
+                    f"keyid {self.keyid} does not match public key content "
+                    f"for {self.keytype}/{self.scheme}"
                 )
 
             signature_bytes = bytes.fromhex(signature.signature)
@@ -558,6 +576,11 @@ class SSlibKey(Key):
                 return self._verify_ed25519_fallback(signature_bytes, data)
 
             return self._verify(signature_bytes, data)
+
+        except VerificationError:
+            # Identity/process errors carry their specific message and must
+            # not be re-wrapped as a generic signature failure.
+            raise
 
         except UnverifiedSignatureError as e:
             raise UnverifiedSignatureError(

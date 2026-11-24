@@ -177,6 +177,70 @@ class TestEnvelope(unittest.TestCase):
         with self.assertRaises(VerificationError):
             envelope_obj.verify(duplicate_keys, 4)  # 3 unique keys, threshold 4.
 
+    def test_verify_rejects_spoofed_keyid(self):
+        """A key with a spoofed keyid but foreign public material is rejected."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+
+        trusted = self.signers[0]
+        attacker = CryptoSigner.generate_ed25519()
+        envelope_obj.sign(trusted)
+
+        # attacker key copies the trusted keyid but keeps its own public key
+        spoofed_key = copy.deepcopy(attacker.public_key)
+        spoofed_key.keyid = trusted.public_key.keyid
+
+        with self.assertRaises(VerificationError):
+            envelope_obj.verify([spoofed_key], 1)
+
+        # the trusted key still verifies and is cached
+        accepted = envelope_obj.verify([trusted.public_key], 1)
+        self.assertEqual(accepted, {trusted.public_key.keyid: trusted.public_key})
+
+    def test_verify_failure_does_not_overwrite_trusted_cache(self):
+        """A failed verification never removes or overwrites a cached key."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+
+        trusted = self.signers[0]
+        attacker = CryptoSigner.generate_ed25519()
+        envelope_obj.sign(trusted)
+
+        spoofed_key = copy.deepcopy(attacker.public_key)
+        spoofed_key.keyid = trusted.public_key.keyid
+
+        # the spoofed key fails but must not replace the trusted key
+        accepted = envelope_obj.verify(
+            [trusted.public_key, spoofed_key], 1
+        )
+        self.assertEqual(
+            accepted, {trusted.public_key.keyid: trusted.public_key}
+        )
+
+    def test_verify_rejects_distinct_keys_with_same_keyid(self):
+        """Two distinct keys claiming one keyid can't collapse in the cache."""
+        envelope_dict = copy.deepcopy(self.envelope_dict)
+        envelope_dict["signatures"] = []
+        envelope_obj = Envelope.from_dict(envelope_dict)
+
+        # two independent keys, forced to share an identity-bound keyid label
+        first = CryptoSigner.generate_ed25519()
+        second = CryptoSigner.generate_ed25519()
+        envelope_obj.sign(first)
+
+        # make second's signature and key look like first's keyid
+        second_sig = second.sign(envelope_obj.pae())
+        second_sig.keyid = first.public_key.keyid
+        envelope_obj.signatures[first.public_key.keyid] = second_sig
+
+        second_key = copy.deepcopy(second.public_key)
+        second_key.keyid = first.public_key.keyid
+
+        with self.assertRaises(VerificationError):
+            envelope_obj.verify([first.public_key, second_key], 1)
+
 
 # Run the unit tests.
 if __name__ == "__main__":

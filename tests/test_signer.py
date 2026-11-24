@@ -163,8 +163,12 @@ class TestKey(unittest.TestCase):
 
     def test_verify_signature_legacy_ecdsa_keytype_deprecated(self):
         """Legacy ecdsa keytypes (keytype == scheme) verify but warn (#363)."""
-        keyid = "985171ff9ee901fbab17aa6f57347933aeae9d194f0f93e83e5c3dbc1755e754"
         pub = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEsYJfSlYU3UlYbGOZfE/yOHkayWWq\nLPR/NeCa83szZmnJGc9wwCRPvJS87K+eDGIhhhKueTyrLqXQqmyHioQbOQ==\n-----END PUBLIC KEY-----\n"
+        keyid = compute_default_keyid(
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp256",
+            {"public": pub},
+        )
         sig = Signature.from_dict(
             {
                 "keyid": keyid,
@@ -187,6 +191,17 @@ class TestKey(unittest.TestCase):
             legacy_key.verify_signature(sig, b"DATA")
 
         # The correct "ecdsa" keytype verifies without a DeprecationWarning
+        keyid = compute_default_keyid(
+            "ecdsa",
+            "ecdsa-sha2-nistp256",
+            {"public": pub},
+        )
+        sig = Signature.from_dict(
+            {
+                "keyid": keyid,
+                "sig": "304502207d0058b745b2259501204c2ba287ba3769ec2420e12463a325c59670c24df9b6022100836ca63a1b870f755c1596711a003a505e72e25cb0970e823a331e044adc63ec",
+            }
+        )
         key = Key.from_dict(
             keyid,
             {
@@ -241,9 +256,13 @@ class TestKey(unittest.TestCase):
         KEY_FOR_TYPE_AND_SCHEME[("custom", "ed25519")] = CustomKey
 
         # setup
+        pub = "8ae43d22b8e0fbf4a48fa3490d31b4d389114f5dc1039c918f075427f4100759"
+        # CustomKey.from_dict rewrites keytype to "ed25519", so the
+        # content-bound keyid is computed for the internal ed25519 key.
+        keyid = compute_default_keyid("ed25519", "ed25519", {"public": pub})
         sig = Signature.from_dict(
             {
-                "keyid": "e33221e745d40465d1efc0215d6db83e5fdb83ea16e1fb894d09d6d96c456f3b",
+                "keyid": keyid,
                 "sig": "3fc91f5411a567d6a7f28b7fbb9ba6d60b1e2a1b64d8af0b119650015d86bb5a55e57c0e2c995a9b4a332b8f435703e934c0e6ce69fe6674a8ce68719394a40b",
             }
         )
@@ -252,11 +271,11 @@ class TestKey(unittest.TestCase):
             "keytype": "custom",
             "scheme": "ed25519",
             "keyval": {
-                "public": "8ae43d22b8e0fbf4a48fa3490d31b4d389114f5dc1039c918f075427f4100759",
+                "public": pub,
             },
         }
         key = Key.from_dict(
-            "e33221e745d40465d1efc0215d6db83e5fdb83ea16e1fb894d09d6d96c456f3b",
+            keyid,
             keydict,
         )
 
@@ -267,6 +286,80 @@ class TestKey(unittest.TestCase):
             key.verify_signature(sig, b"NOT DATA")
 
         del KEY_FOR_TYPE_AND_SCHEME[("custom", "ed25519")]
+
+    def test_verify_signature_keyid_mismatch(self):
+        """A key must not verify signatures that claim another keyid."""
+        signer = CryptoSigner.generate_ed25519()
+        sig = signer.sign(b"DATA")
+
+        # signature keyid does not match key keyid
+        mismatched_sig = copy.deepcopy(sig)
+        mismatched_sig.keyid = "0" * len(sig.keyid)
+        with self.assertRaises(VerificationError):
+            signer.public_key.verify_signature(mismatched_sig, b"DATA")
+
+    def test_verify_signature_requires_content_bound_keyid(self):
+        """An arbitrary keyid does not identify the public key content.
+
+        A key whose keyid is not derived from its keytype, scheme and public
+        material must refuse to verify, so it can never be treated as a
+        different key that shares the keyid label.
+        """
+        signer = CryptoSigner.generate_ed25519()
+        sig = signer.sign(b"DATA")
+
+        key = copy.deepcopy(signer.public_key)
+        key.keyid = "0" * len(key.keyid)
+
+        # re-label the signature so the keyid comparison itself passes:
+        # the content identity check must still reject the key
+        sig.keyid = key.keyid
+        with self.assertRaises(VerificationError):
+            key.verify_signature(sig, b"DATA")
+
+        # keys with an identity-bound keyid continue to verify
+        signer.public_key.verify_signature(
+            signer.sign(b"DATA"), b"DATA"
+        )
+
+    def test_verify_signature_spoofed_keyid_does_not_share_identity(self):
+        """Two different keys with the same spoofed keyid stay distinct.
+
+        An attacker-controlled key that copies a trusted key's keyid but
+        contains different public material must not verify a signature that
+        was produced (and labeled) for the trusted key.
+        """
+        trusted = CryptoSigner.generate_rsa()
+        attacker = CryptoSigner.generate_ed25519()
+
+        trusted_sig = trusted.sign(b"DATA")
+
+        spoofed_key = copy.deepcopy(attacker.public_key)
+        spoofed_key.keyid = trusted.public_key.keyid
+
+        with self.assertRaises(UnverifiedSignatureError):
+            spoofed_key.verify_signature(trusted_sig, b"DATA")
+
+        # even a signature made by the attacker, re-labeled with the trusted
+        # keyid, must not be accepted under that identity
+        attacker_sig = attacker.sign(b"DATA")
+        attacker_sig.keyid = trusted.public_key.keyid
+        with self.assertRaises(UnverifiedSignatureError):
+            spoofed_key.verify_signature(attacker_sig, b"DATA")
+
+        # the genuine key still verifies
+        trusted.public_key.verify_signature(trusted_sig, b"DATA")
+
+    def test_common_keys_load_without_private_material(self):
+        """RSA and ed25519 public keys load (from_dict) without a signer."""
+        for signer in (
+            CryptoSigner.generate_rsa(),
+            CryptoSigner.generate_ed25519(),
+        ):
+            public = signer.public_key
+            loaded = Key.from_dict(public.keyid, public.to_dict())
+            self.assertEqual(loaded, public)
+            loaded.verify_signature(signer.sign(b"DATA"), b"DATA")
 
 
 class TestSSlibKey(unittest.TestCase):
@@ -724,6 +817,13 @@ class TestCryptoSigner(unittest.TestCase):
             public_key = SSlibKey.from_crypto(private_key.public_key())
             for scheme in self.schemes[name]:
                 public_key.scheme = scheme
+                # The keyid is bound to the key content including the scheme:
+                # recompute it so the key keeps a valid identity.
+                public_key.keyid = compute_default_keyid(
+                    public_key.keytype,
+                    public_key.scheme,
+                    public_key.keyval,
+                )
                 signer = CryptoSigner(private_key, public_key)
                 sig = signer.sign(b"DATA")
                 self.assertIsNone(signer.public_key.verify_signature(sig, b"DATA"))
@@ -750,6 +850,13 @@ class TestCryptoSigner(unittest.TestCase):
             public_key = SSlibKey.from_crypto(pub_crypto_key)
             if keytype_override:
                 public_key.keytype = keytype_override
+                # The keyid is bound to the key content including the
+                # keytype: recompute it so the key keeps a valid identity.
+                public_key.keyid = compute_default_keyid(
+                    public_key.keytype,
+                    public_key.scheme,
+                    public_key.keyval,
+                )
 
             for use_prefix in [True, False]:
                 if use_prefix:

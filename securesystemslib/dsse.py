@@ -162,10 +162,21 @@ class Envelope:
                 # If a key verifies the signature, we exit and use the result.
                 try:
                     key.verify_signature(signature, pae)
-                    accepted_keys[key.keyid] = key
-                    break
                 except exceptions.UnverifiedSignatureError:
                     continue
+
+                # Only cache a key after its identity and the signature have
+                # been verified. A failed verification never reaches this
+                # point, so it can neither add nor overwrite a trusted entry.
+                # Two distinct keys claiming the same keyid are rejected
+                # instead of silently collapsing into one cache entry.
+                if key.keyid in accepted_keys and accepted_keys[key.keyid] != key:
+                    raise exceptions.VerificationError(
+                        f"Unique key expected for keyid {key.keyid}"
+                    )
+
+                accepted_keys[key.keyid] = key
+                break
 
             # Break, if amount of accepted_keys are more than threshold.
             if len(accepted_keys) >= threshold:

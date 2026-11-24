@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Security
+
+* `SSlibKey.verify_signature()` now only verifies signatures whose keyid
+  both matches the key's keyid and is bound to the key content (keytype,
+  scheme and public material). A key with an arbitrary or spoofed keyid can
+  no longer be treated as, or verify signatures in place of, another key.
+  `Envelope.verify()` only caches a key after its identity and the signature
+  are verified, so a failed verification can no longer add or overwrite a
+  trusted cache entry.
+
 ## 1.6.0
 
 ### Changed
