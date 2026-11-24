@@ -61,9 +61,123 @@ class TestKey(unittest.TestCase):
                 },
             }
 
-            key = Key.from_dict("aa", copy.deepcopy(keydict))
+            key_dict = copy.deepcopy(keydict)
+            key = Key.from_dict("aa", key_dict)
             self.assertIsInstance(key, key_impl)
-            self.assertDictEqual(keydict, key.to_dict())
+
+            # from_dict must not modify the caller's dict
+            self.assertDictEqual(key_dict, keydict)
+
+            # to_dict must only publish the verifiable public key identity:
+            # no unrecognized top-level fields and no non-public keyval
+            self.assertDictEqual(
+                key.to_dict(),
+                {
+                    "keytype": keytype,
+                    "scheme": scheme,
+                    "keyval": {"public": "pubkeyval"},
+                },
+            )
+            self.assertNotIn("foo", key.keyval)
+            self.assertNotIn("private", key.keyval)
+
+            # unrecognized fields remain available on the instance but are
+            # never re-serialized
+            self.assertIn("extra", key.unrecognized_fields)
+            self.assertIn("hashes", key.unrecognized_fields)
+
+            # clean dicts still round-trip
+            clean = {
+                "keytype": keytype,
+                "scheme": scheme,
+                "keyval": {"public": "pubkeyval"},
+            }
+            roundtrip_key = Key.from_dict("aa", copy.deepcopy(clean))
+            self.assertDictEqual(clean, roundtrip_key.to_dict())
+
+    def test_key_dict_does_not_leak_private_or_unknown_content(self):
+        """Private key bytes and unknown fields never reach to_dict()."""
+        public = "8ae43d22b8e0fbf4a48fa3490d31b4d389114f5dc1039c918f075427f4100759"
+        key_dict = {
+            "keytype": "ed25519",
+            "scheme": "ed25519",
+            "keyval": {
+                "public": public,
+                # private material and other opaque keyval content
+                "private": "5e5c2f...secret-bytes",
+                "junk": {"nested": ["bytes"]},
+            },
+            # unknown top-level fields, including private-looking ones
+            "private": "top-level-secret",
+            "unrecognized": "data",
+        }
+        original = copy.deepcopy(key_dict)
+        key = Key.from_dict("aa", key_dict)
+
+        # input is not mutated
+        self.assertDictEqual(key_dict, original)
+
+        serialized = key.to_dict()
+        serialized_json = json.dumps(serialized)
+        self.assertNotIn("secret", serialized_json)
+        self.assertNotIn("junk", serialized_json)
+        self.assertNotIn("unrecognized", serialized_json)
+        self.assertDictEqual(
+            serialized,
+            {
+                "keytype": "ed25519",
+                "scheme": "ed25519",
+                "keyval": {"public": public},
+            },
+        )
+
+        # the stored keyval itself cannot be used to smuggle content
+        self.assertEqual(key.keyval, {"public": public})
+
+    def test_from_dict_invalid_input_does_not_mutate_dict(self):
+        """Bad input leaves the caller's dict and existing key untouched."""
+        invalid_dicts = [
+            {"scheme": "ed25519", "keyval": {"public": "abc"}},
+            {"keytype": "ed25519", "keyval": {"public": "abc"}},
+            {"keytype": "ed25519", "scheme": "ed25519"},
+            {"keytype": "ed25519", "scheme": "ed25519", "keyval": {"x": "y"}},
+            {
+                "keytype": "ed25519",
+                "scheme": "ed25519",
+                "keyval": {"public": b"abc"},
+            },
+        ]
+        for keydict in invalid_dicts:
+            snapshot = copy.deepcopy(keydict)
+            with self.assertRaises((KeyError, ValueError)):
+                Key.from_dict("aa", keydict)
+            self.assertDictEqual(keydict, snapshot)
+
+    def test_gpg_key_does_not_leak_private_or_unknown_content(self):
+        """GPG key serialization only publishes the public keyval content."""
+        key_dict = {
+            "keytype": "rsa",
+            "scheme": "pgp+rsa-pkcsv1.5",
+            "hashes": ["pgp+rsa-pkcsv1.5"],
+            "keyval": {
+                "private": "private-material",
+                "public": {"n": "abc", "e": "010001"},
+                "junk": "data",
+            },
+            "unrecognized": "field",
+        }
+        snapshot = copy.deepcopy(key_dict)
+        key = GPGKey.from_dict("aa", key_dict)
+
+        # from_dict must not mutate the caller's dict
+        self.assertDictEqual(key_dict, snapshot)
+
+        self.assertEqual(key.keyval, {"public": {"n": "abc", "e": "010001"}})
+        serialized = json.dumps(key.to_dict())
+        self.assertNotIn("private", serialized)
+        self.assertNotIn("junk", serialized)
+        self.assertNotIn("unrecognized", serialized)
+        self.assertNotIn("hashes", serialized)
 
     def test_key_hash(self):
         """Keys should be hashable, even with dict keyval and extra fields."""
@@ -397,7 +511,11 @@ class TestSigner(unittest.TestCase):
             "keyid": "11fa391a0ed7a447cbfeb4b2667e286fc248f64d5e6d0eeed2e5e23f97f9f714",
             "foo": "bar",  # unrecognized_field
         }
-        sig_obj = Signature.from_dict(copy.copy(signature_dict))
+        sig_dict = copy.deepcopy(signature_dict)
+        sig_obj = Signature.from_dict(sig_dict)
+
+        # from_dict must not modify the caller's dict
+        self.assertDictEqual(sig_dict, signature_dict)
 
         # Verify that unrecognized fields are stored correctly.
         self.assertEqual(sig_obj.unrecognized_fields, {"foo": "bar"})

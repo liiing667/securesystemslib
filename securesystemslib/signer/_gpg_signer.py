@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 from urllib import parse
@@ -33,10 +34,28 @@ class GPGKey(Key):
             by Securesystemslib
     """
 
+    def __init__(
+        self,
+        keyid: str,
+        keytype: str,
+        scheme: str,
+        keyval: dict[str, Any],
+        unrecognized_fields: dict[str, Any] | None = None,
+    ):
+        # Work on a copy so that the caller's keyval is not modified and so
+        # that any private key material (e.g. the legacy "private" field) or
+        # other unknown content can never be re-published via to_dict(). Only
+        # the verifiable "public" portion of keyval is retained.
+        keyval = {"public": copy.deepcopy(keyval["public"])}
+        super().__init__(keyid, keytype, scheme, keyval, unrecognized_fields)
+
     @classmethod
     def from_dict(cls, keyid: str, key_dict: dict[str, Any]) -> GPGKey:
         keytype, scheme, keyval = cls._from_dict(key_dict)
-        return cls(keyid, keytype, scheme, keyval, key_dict)
+        unrecognized_fields = cls._parse_unrecognized_fields(key_dict)
+        return cls(
+            keyid, keytype, scheme, copy.deepcopy(keyval), unrecognized_fields
+        )
 
     def to_dict(self) -> dict:
         return self._to_dict()

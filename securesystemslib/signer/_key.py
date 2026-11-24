@@ -213,26 +213,53 @@ class Key(metaclass=ABCMeta):
 
         Key implementations may call this in their to_dict, which they must
         still provide, in order to avoid unnoticed serialization accidents.
+
+        Only the verifiable public key identity (keytype, scheme and keyval)
+        is published. Unrecognized fields, including anything that looks like
+        private key material, are intentionally not serialized: callers must
+        not be able to smuggle such content into the public representation of
+        a key via ``from_dict``/``to_dict`` round-trips.
         """
         return {
             "keytype": self.keytype,
             "scheme": self.scheme,
             "keyval": self.keyval,
-            **self.unrecognized_fields,
         }
 
     @staticmethod
     def _from_dict(key_dict: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-        """Deserialization helper to pop base Key fields off the dict.
+        """Deserialization helper to read the base Key fields from the dict.
 
         Key implementations may call this in their from_dict, in order to parse
         out common fields. But they have to create the Key instance themselves.
+
+        The passed dict is never modified: fields are read from a shallow copy
+        so that failing or succeeding deserialization leaves the caller's data
+        untouched. Everything besides the recognized base fields is returned
+        separately as unrecognized fields instead of being mutated in place.
         """
+        key_dict = dict(key_dict)
         keytype = key_dict.pop("keytype")
         scheme = key_dict.pop("scheme")
         keyval = key_dict.pop("keyval")
 
         return keytype, scheme, keyval
+
+    @staticmethod
+    def _parse_unrecognized_fields(
+        key_dict: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return a copy of the fields not managed by securesystemslib.
+
+        The input dict is not modified. Unrecognized fields are kept on the
+        Key instance for inspection and compatibility, but they are never
+        published by ``to_dict`` (see ``_to_dict``).
+        """
+        return {
+            key: value
+            for key, value in key_dict.items()
+            if key not in ("keytype", "scheme", "keyval")
+        }
 
     @abstractmethod
     def verify_signature(self, signature: Signature, data: bytes) -> None:
@@ -262,8 +289,14 @@ class SSlibKey(Key):
         keyval: dict[str, Any],
         unrecognized_fields: dict[str, Any] | None = None,
     ):
-        if "public" not in keyval or not isinstance(keyval["public"], str):
+        public = keyval.get("public")
+        if not isinstance(public, str):
             raise ValueError(f"public key string required for scheme {scheme}")
+        # Only store the verifiable public key value: drop any additional
+        # keyval entries (e.g. "private" or other opaque bytes) so that they
+        # can never be published via to_dict() or leak into error messages.
+        # Operate on a copy so that the caller's keyval is not modified.
+        keyval = {"public": public}
         super().__init__(keyid, keytype, scheme, keyval, unrecognized_fields)
 
     def get_hash_algorithm_name(self) -> str:
@@ -314,8 +347,11 @@ class SSlibKey(Key):
     def from_dict(cls, keyid: str, key_dict: dict[str, Any]) -> SSlibKey:
         keytype, scheme, keyval = cls._from_dict(key_dict)
 
-        # All fields left in the key_dict are unrecognized.
-        return cls(keyid, keytype, scheme, keyval, key_dict)
+        # All fields besides the base fields are unrecognized. They are kept
+        # on the instance but never serialized again (see Key._to_dict). The
+        # caller's key_dict is not modified.
+        unrecognized_fields = cls._parse_unrecognized_fields(key_dict)
+        return cls(keyid, keytype, scheme, dict(keyval), unrecognized_fields)
 
     def to_dict(self) -> dict[str, Any]:
         return self._to_dict()

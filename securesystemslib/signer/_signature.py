@@ -80,17 +80,17 @@ class Signature:
             KeyError: If any of the "keyid" and "sig" fields are missing from
                 the signature_dict.
 
-        Side Effect:
-            Destroys the metadata dict passed by reference.
-
         Returns:
             A "Signature" instance.
         """
 
+        # Do not modify the caller's dict: read the recognized fields from a
+        # copy and collect the remaining fields as unrecognized ones.
+        signature_dict = dict(signature_dict)
         keyid = signature_dict.pop("keyid")
         sig = signature_dict.pop("sig")
-        # All fields left in the signature_dict are unrecognized.
-        return cls(keyid, sig, signature_dict)
+        # All fields left in the local copy are unrecognized.
+        return cls(keyid, sig, dict(signature_dict))
 
     def to_dict(self) -> dict:
         """Returns the JSON-serializable dictionary representation of self."""

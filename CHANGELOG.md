@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security
+
+* Key and Signature `from_dict()` no longer modify the passed dict and key
+  serialization (`to_dict()`) only publishes the verifiable public key
+  identity (`keytype`, `scheme` and the public portion of `keyval`).
+  Unrecognized fields and non-public keyval content, such as private key
+  bytes, are no longer round-tripped through the public serialization API and
+  cannot leak into error messages. Invalid input raises before any state is
+  changed. RSA, ECDSA, Ed25519 and ML-DSA round-trips and signature
+  verification continue to work as before.
+
 ## 1.6.0
 
 ### Changed

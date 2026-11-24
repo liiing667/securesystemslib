@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from typing import Any
@@ -46,15 +47,28 @@ class SigstoreKey(Key):
         keyval: dict[str, Any],
         unrecognized_fields: dict[str, Any] | None = None,
     ):
+        public_keyval = {}
         for content in ["identity", "issuer"]:
-            if content not in keyval or not isinstance(keyval[content], str):
+            value = keyval.get(content)
+            if not isinstance(value, str):
                 raise ValueError(f"{content} string required for scheme {scheme}")
-        super().__init__(keyid, keytype, scheme, keyval, unrecognized_fields)
+            # Only retain the verifiable identity: drop any additional keyval
+            # entries (e.g. private key material) and avoid modifying the
+            # caller's keyval.
+            public_keyval[content] = value
+        super().__init__(keyid, keytype, scheme, public_keyval, unrecognized_fields)
 
     @classmethod
     def from_dict(cls, keyid: str, key_dict: dict[str, Any]) -> SigstoreKey:
         keytype, scheme, keyval = cls._from_dict(key_dict)
-        return cls(keyid, keytype, scheme, keyval, key_dict)
+        unrecognized_fields = cls._parse_unrecognized_fields(key_dict)
+        return cls(
+            keyid,
+            keytype,
+            scheme,
+            copy.deepcopy(keyval),
+            unrecognized_fields,
+        )
 
     def to_dict(self) -> dict:
         return self._to_dict()
