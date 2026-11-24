@@ -26,7 +26,7 @@ class FormatError(Error):
     """Indicate an error while validating an object's format."""
 
 
-class UnsupportedAlgorithmError(Error):
+class UnsupportedAlgorithmError(Error, ValueError):
     """Indicate an error while trying to identify a user-specified algorithm."""
 
 
@@ -41,6 +41,10 @@ class KeyMismatchError(ValueError):
 class StorageError(Error):
     """Indicate an error occured during interaction with an abstracted storage
     backend."""
+
+
+class UnsafeFileError(StorageError, ValueError):
+    """Indicate that a file path is not a safe, stable file identity."""
 
 
 class UnverifiedSignatureError(Error):

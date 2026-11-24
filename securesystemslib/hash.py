@@ -22,6 +22,8 @@
 """
 
 import hashlib
+import os
+import stat
 
 from securesystemslib import exceptions
 from securesystemslib.storage import FilesystemBackend
@@ -30,6 +32,94 @@ DEFAULT_CHUNK_SIZE = 4096
 DEFAULT_HASH_ALGORITHM = "sha256"
 DEFAULT_HASH_LIBRARY = "hashlib"
 SUPPORTED_LIBRARIES = ["hashlib"]
+_FILE_IDENTITY_FIELDS = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+
+
+def _file_identity(file_stat: os.stat_result) -> tuple[object, ...]:
+    """Return the metadata that binds a path to the bytes being hashed."""
+    return tuple(getattr(file_stat, field) for field in _FILE_IDENTITY_FIELDS)
+
+
+def _stat_open_file(file_object: object) -> os.stat_result | None:
+    """Return an open file's stat result when it exposes a descriptor."""
+    fileno = getattr(file_object, "fileno", None)
+    if not callable(fileno):
+        return None
+
+    try:
+        fd = fileno()
+        return os.fstat(fd)
+    except (OSError, TypeError, ValueError):
+        # Non-filesystem and test double file objects need not expose a
+        # descriptor.  digest_filename() still hashes them through the backend.
+        return None
+
+
+def _confirmed_file_stat(
+    filename: str, file_object: object, storage_backend: object
+) -> os.stat_result | None:
+    """Validate and return identity metadata for a stock filesystem file."""
+    if not isinstance(storage_backend, FilesystemBackend):
+        return None
+
+    file_stat = _stat_open_file(file_object)
+    if file_stat is None:
+        return None
+
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"Refusing to digest non-regular file: {filename!r}")
+    if file_stat.st_size < 0:
+        raise ValueError(f"File has a negative length: {filename!r}")
+
+    return file_stat
+
+
+def _verify_file_identity(
+    filename: str, file_object: object, initial_stat: os.stat_result | None
+) -> None:
+    """Ensure the completed read covered one stable, complete file."""
+    if initial_stat is None:
+        return
+
+    tell = getattr(file_object, "tell", None)
+    try:
+        bytes_read = tell() if callable(tell) else None
+    except (OSError, ValueError):
+        bytes_read = None
+
+    # A premature EOF/short read must not be published as a complete digest
+    # even if the hash object itself looks well-formed.
+    if (
+        not isinstance(bytes_read, int)
+        or isinstance(bytes_read, bool)
+        or bytes_read < 0
+        or bytes_read != initial_stat.st_size
+    ):
+        raise ValueError(f"File was not read completely: {filename!r}")
+
+    final_stat = _stat_open_file(file_object)
+    if final_stat is None or _file_identity(initial_stat) != _file_identity(
+        final_stat
+    ):
+        raise ValueError(
+            f"File changed while its digest was calculated: {filename!r}"
+        )
+
+    try:
+        path_stat = os.stat(filename)
+    except OSError as exc:
+        raise ValueError(
+            f"Digested file no longer has a stable path: {filename!r}"
+        ) from exc
+
+    if (path_stat.st_dev, path_stat.st_ino) != (
+        initial_stat.st_dev,
+        initial_stat.st_ino,
+    ):
+        raise ValueError(
+            "File was replaced while its digest was calculated: "
+            f"{filename!r}"
+        )
 
 
 # If `pyca_crypto` is installed, add it to supported libraries
@@ -250,6 +340,14 @@ def digest_fileobject(
     # securesystemslib.exceptions.UnsupportedLibraryError
     digest_object = digest(algorithm, hash_library)
 
+    chunk_size = DEFAULT_CHUNK_SIZE
+    if (
+        isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, int)
+        or chunk_size <= 0
+    ):
+        raise ValueError("hash read length must be a positive integer")
+
     # Defensively seek to beginning, as there's no case where we don't
     # intend to start from the beginning of the file.
     file_object.seek(0)
@@ -258,7 +356,7 @@ def digest_fileobject(
     # Update the hash with the data read from each chunk and return after
     # the entire file is processed.
     while True:
-        data = file_object.read(DEFAULT_CHUNK_SIZE)
+        data = file_object.read(chunk_size)
         if not data:
             break
 
@@ -326,6 +424,10 @@ def digest_filename(
 
       securesystemslib.exceptions.StorageError, if the file cannot be opened.
 
+      ValueError, if the path is a symbolic link or non-regular file, has an
+      invalid length, cannot be read completely, or changes identity while
+      its digest is being calculated.
+
     <Side Effects>
       None.
 
@@ -336,13 +438,21 @@ def digest_filename(
         hashlib.new(algorithm) or
         PycaDiggestWrapper object
     """
-    digest_object = None
-
     if storage_backend is None:
         storage_backend = FilesystemBackend()
 
-    # Open 'filename' in read+binary mode.
+    # Validate the algorithm before touching the filesystem.  An unknown
+    # algorithm/library must never be able to produce a returned digest object.
+    digest(algorithm, hash_library)
+
+    # Open 'filename' in read+binary mode.  The stock filesystem backend opens
+    # it with O_NOFOLLOW and rejects symlinks.  When an fd is available, bind
+    # the returned digest to that one file identity and re-check it after read.
     with storage_backend.get(filename) as file_object:
+        initial_stat = _confirmed_file_stat(
+            filename, file_object, storage_backend
+        )
+
         # Create digest_object and update its hash data from file_object.
         # digest_fileobject() raises:
         # securesystemslib.exceptions.UnsupportedAlgorithmError
@@ -350,5 +460,7 @@ def digest_filename(
         digest_object = digest_fileobject(
             file_object, algorithm, hash_library, normalize_line_endings
         )
+
+        _verify_file_identity(filename, file_object, initial_stat)
 
     return digest_object

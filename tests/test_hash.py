@@ -176,6 +176,47 @@ class TestHash(unittest.TestCase):
     def test_update_filename(self):
         self._run_with_all_algos_and_libs(self._do_update_filename)
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not available")
+    def test_digest_filename_rejects_symlink(self):
+        data = b"confirmed file contents"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target")
+            link = os.path.join(temp_dir, "link")
+            with open(target, "wb") as target_file:
+                target_file.write(data)
+
+            try:
+                os.symlink(target, link)
+            except (NotImplementedError, OSError):
+                self.skipTest("current user cannot create symlinks")
+
+            with self.assertRaises(ValueError):
+                securesystemslib.hash.digest_filename(link, "sha256")
+
+            expected = securesystemslib.hash.digest("sha256")
+            expected.update(data)
+            actual = securesystemslib.hash.digest_filename(target, "sha256")
+            self.assertEqual(expected.digest(), actual.digest())
+
+    def test_digest_filename_rejects_unknown_algorithm_before_file(self):
+        with self.assertRaises(
+            securesystemslib.exceptions.UnsupportedAlgorithmError
+        ):
+            securesystemslib.hash.digest_filename(
+                "definitely/not/opened", algorithm="not-an-algorithm"
+            )
+
+    def test_digest_fileobject_rejects_nonpositive_read_length(self):
+        original_chunk_size = securesystemslib.hash.DEFAULT_CHUNK_SIZE
+        securesystemslib.hash.DEFAULT_CHUNK_SIZE = -1
+        try:
+            with self.assertRaises(ValueError):
+                securesystemslib.hash.digest_fileobject(
+                    io.BytesIO(b"data"), algorithm="sha256"
+                )
+        finally:
+            securesystemslib.hash.DEFAULT_CHUNK_SIZE = original_chunk_size
+
     def _do_update_filename(self, library, algorithm):
         data = "abcdefgh" * 4096
         fd, filename = tempfile.mkstemp()

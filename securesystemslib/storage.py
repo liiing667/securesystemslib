@@ -197,12 +197,39 @@ class FilesystemBackend(StorageBackendInterface):
     @contextmanager
     def get(self, filepath: str) -> Iterator[BinaryIO]:
         file_object = None
+        fd: int | None = None
         try:
-            file_object = open(filepath, "rb")
+            try:
+                file_stat = os.lstat(filepath)
+                if stat.S_ISLNK(file_stat.st_mode):
+                    raise exceptions.UnsafeFileError(
+                        f"Refusing to read symbolic link {filepath!r}"
+                    )
+
+                flags = os.O_RDONLY
+                o_nofollow = getattr(os, "O_NOFOLLOW", None)
+                if o_nofollow is not None:
+                    flags |= o_nofollow
+
+                fd = os.open(filepath, flags)
+                file_object = os.fdopen(fd, "rb")
+                # os.fdopen() now owns the descriptor.
+                fd = None
+            except exceptions.UnsafeFileError:
+                raise
+            except OSError as e:
+                if e.errno == getattr(errno, "ELOOP", -1):
+                    raise exceptions.UnsafeFileError(
+                        f"Refusing to read symbolic link {filepath!r}"
+                    ) from e
+                raise exceptions.StorageError(f"Can't open {filepath}") from e
+
             yield file_object
         except OSError:
             raise exceptions.StorageError(f"Can't open {filepath}")
         finally:
+            if fd is not None:
+                os.close(fd)
             if file_object is not None:
                 file_object.close()
 
@@ -258,9 +285,16 @@ class FilesystemBackend(StorageBackendInterface):
 
     def getsize(self, filepath: str) -> int:
         try:
+            file_stat = os.lstat(filepath)
+            if stat.S_ISLNK(file_stat.st_mode):
+                raise exceptions.UnsafeFileError(
+                    f"Refusing to inspect symbolic link {filepath!r}"
+                )
             return os.path.getsize(filepath)
-        except OSError:
-            raise exceptions.StorageError(f"Can't access file {filepath}")
+        except exceptions.UnsafeFileError:
+            raise
+        except OSError as e:
+            raise exceptions.StorageError(f"Can't access file {filepath}") from e
 
     def create_folder(self, filepath: str) -> None:
         try:
