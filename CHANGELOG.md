@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+* `Signer.sign` and DSSE `Envelope.sign` now only commit a signature after it
+  has been fully generated. A signing failure no longer leaves a partial
+  `Signature` behind and the signer can be retried with the same trusted key.
+  Signing is serialized to keep concurrent calls safe, and signatures whose
+  keyid does not match the signer's public key are rejected.
+
 ## 1.6.0
 
 ### Changed

@@ -80,6 +80,7 @@ class AWSSigner(Signer):
     }
 
     def __init__(self, aws_key_id: str, public_key: SSlibKey):
+        super().__init__()
         if AWS_IMPORT_ERROR:
             raise UnsupportedLibraryError(AWS_IMPORT_ERROR)
 
@@ -187,7 +188,7 @@ class AWSSigner(Signer):
         public_key = SSlibKey(keyid, keytype, local_scheme, keyval)
         return f"{cls.SCHEME}:{aws_key_id}", public_key
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         """Sign the payload with the AWS KMS key
 
         This method computes the hash of the payload locally and sends only the

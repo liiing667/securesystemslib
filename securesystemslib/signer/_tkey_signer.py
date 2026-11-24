@@ -54,6 +54,7 @@ class TKeySigner(Signer):
         passphrase: str | None,
         digest: str | None,
     ) -> None:
+        super().__init__()
         if TKEY_IMPORT_ERROR:
             raise UnsupportedLibraryError(TKEY_IMPORT_ERROR)
 
@@ -163,7 +164,7 @@ class TKeySigner(Signer):
 
         return uri, key
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         """Signs payload with Tillitis TKey."""
 
         # Provide the pub key bytes for mu calculation

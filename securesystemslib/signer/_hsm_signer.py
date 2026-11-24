@@ -98,6 +98,7 @@ class HSMSigner(Signer):
         pin_handler: SecretsHandler,
         token_label: str | None = None,
     ):
+        super().__init__()
         if CRYPTO_IMPORT_ERROR:
             raise UnsupportedLibraryError(CRYPTO_IMPORT_ERROR)
 
@@ -249,7 +250,7 @@ class HSMSigner(Signer):
 
         return cls(keyid, public_key, secrets_handler, token_label)
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         """Signs payload with Hardware Security Module (HSM).
 
         Arguments:

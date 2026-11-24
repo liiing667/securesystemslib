@@ -181,6 +181,8 @@ class CryptoSigner(Signer):
         private_key: PrivateKeyTypes,
         public_key: SSlibKey | None = None,
     ):
+        super().__init__()
+
         def assert_type(
             name: str, key: PrivateKeyTypes, typ: type[PrivateKeyTypes]
         ) -> None:
@@ -439,7 +441,7 @@ class CryptoSigner(Signer):
         public_key = SSlibKey.from_crypto(private_key.public_key(), keyid, scheme)
         return CryptoSigner(private_key, public_key)
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         if self.public_key.keytype == KEY_TYPE_MLDSA:
             # ml-dsa keytype specifies a domain-specific hash prefixing scheme
             payload = get_mldsa_payload(payload, 1)

@@ -117,6 +117,7 @@ class GCPSigner(Signer):
     SCHEME = "gcpkms"
 
     def __init__(self, gcp_keyid: str, public_key: SSlibKey):
+        super().__init__()
         if GCP_IMPORT_ERROR:
             raise exceptions.UnsupportedLibraryError(GCP_IMPORT_ERROR)
 
@@ -189,7 +190,7 @@ class GCPSigner(Signer):
 
         return f"{cls.SCHEME}:{gcp_keyid}", public_key
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         # NOTE: request and response can contain CRC32C of the digest/sig:
         # Verifying could be useful but would require another dependency...
 

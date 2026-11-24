@@ -88,6 +88,7 @@ class GPGSigner(Signer):
         public_key: Key,
         homedir: str | None = None,
     ):
+        super().__init__()
         self.homedir = homedir
         self._public_key = public_key
 
@@ -194,7 +195,7 @@ class GPGSigner(Signer):
 
         return (uri, public_key)
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         """Signs payload with GnuPG.
 
         Arguments:

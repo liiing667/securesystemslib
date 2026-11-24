@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 
+from securesystemslib.exceptions import KeyMismatchError
 from securesystemslib.signer._key import Key
 from securesystemslib.signer._signature import Signature
 
@@ -65,9 +67,64 @@ class Signer(metaclass=ABCMeta):
     used.
     """
 
-    @abstractmethod
+    def __init__(self) -> None:
+        # Re-entrant lock so that sign() can be called concurrently and (for
+        # custom signers) nested via _sign() without dead-locking. The lock
+        # makes sure a failing signing attempt cannot leave another caller
+        # with a half-written signature or mutated key state.
+        self._lock = threading.RLock()
+
+    def __getstate__(self) -> dict:
+        # Locks are not copyable/picklable: drop it when copying the signer.
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+
     def sign(self, payload: bytes) -> Signature:
         """Signs a given payload by the key assigned to the Signer instance.
+
+        The signing is serialized with a re-entrant lock and its result is
+        only returned once a complete :class:`Signature` has been produced:
+        if the concrete signer implementation fails mid-way, the exception
+        propagates and no (partial) signature is committed. The signer
+        instance and its key state stay untouched and can be retried with the
+        same trusted key.
+
+        Arguments:
+            payload: The bytes to be signed.
+
+        Raises:
+            KeyMismatchError: The produced signature's keyid does not match
+                the keyid of the signer's public key.
+
+        Returns:
+            Returns a "Signature" class instance.
+        """
+        with self._lock:
+            signature = self._sign(payload)
+
+        # Only accept the signature once it is complete and provably tied to
+        # the signer's trusted key: a mismatched keyid must never be committed
+        # (e.g. into a DSSE envelope) and the old key state must be kept.
+        if signature.keyid != self.public_key.keyid:
+            raise KeyMismatchError(
+                f"Signature keyid {signature.keyid} does not match the"
+                f" signer public key keyid {self.public_key.keyid}"
+            )
+
+        return signature
+
+    @abstractmethod
+    def _sign(self, payload: bytes) -> Signature:
+        """Create a signature for the given payload.
+
+        Concrete signers implement the actual signing here. The method is
+        called by :meth:`sign`, which takes care of serialization and of
+        validating the returned signature before it is committed.
 
         Arguments:
             payload: The bytes to be signed.

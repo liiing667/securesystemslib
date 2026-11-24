@@ -135,6 +135,7 @@ class SigstoreSigner(Signer):
     SCHEME = "sigstore"
 
     def __init__(self, token: Any, public_key: Key):
+        super().__init__()
         self._public_key = public_key
         # token is of type sigstore.oidc.IdentityToken but the module should be usable
         # without sigstore so it's not annotated
@@ -243,7 +244,7 @@ class SigstoreSigner(Signer):
         token = issuer.identity_token()
         return cls.import_(token.identity, token.federated_issuer, False)
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         """Signs payload using the OIDC token on the signer instance.
 
         Arguments:

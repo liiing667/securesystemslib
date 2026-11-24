@@ -93,6 +93,7 @@ class AzureSigner(Signer):
     SCHEME = "azurekms"
 
     def __init__(self, az_key_uri: str, public_key: SSlibKey):
+        super().__init__()
         if AZURE_IMPORT_ERROR:
             raise UnsupportedLibraryError(AZURE_IMPORT_ERROR)
 
@@ -221,7 +222,7 @@ class AzureSigner(Signer):
 
         return priv_key_uri, public_key
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         """Signs payload with Azure Key Vault.
 
         Arguments:

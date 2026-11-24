@@ -5,10 +5,13 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 import warnings
 from contextlib import suppress
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 
 from cryptography.hazmat.primitives.serialization import (
@@ -468,6 +471,134 @@ class TestSigner(unittest.TestCase):
 
 
 @unittest.skipIf(not have_gpg(), "gpg not found")
+class TestSignerAtomicity(unittest.TestCase):
+    """Failure atomicity and concurrency guarantees of Signer.sign()."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(PEMS_DIR / "ed25519_private.pem", "rb") as f:
+            cls.private_key = load_pem_private_key(f.read(), None)
+        cls.public_key = SSlibKey.from_crypto(cls.private_key.public_key())
+
+    def _make_signer(self):
+        return CryptoSigner(self.private_key)
+
+    def test_sign_returns_complete_signature(self):
+        """A successful sign() returns a full, verifiable Signature."""
+        signer = self._make_signer()
+        sig = signer.sign(b"DATA")
+
+        self.assertIsInstance(sig, Signature)
+        self.assertEqual(sig.keyid, signer.public_key.keyid)
+        self.assertIsNone(signer.public_key.verify_signature(sig, b"DATA"))
+
+    def test_sign_failure_leaves_no_partial_state_and_retry_works(self):
+        """A failing sign() must not commit anything and must stay retriable.
+
+        The same trusted signer/key is reused after the failure.
+        """
+
+        class FlakySigner(CryptoSigner):
+            def __init__(self, private_key):
+                super().__init__(private_key)
+                self.attempts = 0
+                self.key_seen = None
+
+            def _sign(self, payload):
+                self.attempts += 1
+                # remember the key state used for each signing attempt
+                self.key_seen = self.public_key.keyid
+                if self.attempts == 1:
+                    raise RuntimeError("signer failed mid-way")
+                return super()._sign(payload)
+
+        signer = FlakySigner(self.private_key)
+        keyid_before = signer.public_key.keyid
+
+        # First attempt fails and nothing is committed to the caller.
+        with self.assertRaises(RuntimeError):
+            signer.sign(b"DATA")
+
+        # The same trusted key is still in place ...
+        self.assertEqual(signer.public_key.keyid, keyid_before)
+        self.assertEqual(signer.key_seen, keyid_before)
+
+        # ... and a retry with the same signer succeeds with a full signature.
+        sig = signer.sign(b"DATA")
+        self.assertEqual(signer.attempts, 2)
+        self.assertEqual(sig.keyid, keyid_before)
+        self.assertIsNone(signer.public_key.verify_signature(sig, b"DATA"))
+
+    def test_sign_rejects_signature_with_unexpected_keyid(self):
+        """A signature not bound to the signer's trusted key is rejected."""
+
+        class KeyConfusedSigner(CryptoSigner):
+            def _sign(self, payload):
+                sig = super()._sign(payload)
+                return Signature("untrusted-keyid", sig.signature)
+
+        signer = KeyConfusedSigner(self.private_key)
+
+        with self.assertRaises(KeyMismatchError):
+            signer.sign(b"DATA")
+
+        # the trusted key state is unchanged and still usable
+        sig = CryptoSigner(self.private_key).sign(b"DATA")
+        self.assertIsNone(signer.public_key.verify_signature(sig, b"DATA"))
+
+    def test_concurrent_signing_is_serialized_and_all_succeed(self):
+        """Legitimate concurrent sign() calls all complete with full sigs."""
+
+        class TrackingSigner(CryptoSigner):
+            def __init__(self, private_key):
+                super().__init__(private_key)
+                self.active = 0
+                self.max_active = 0
+
+            def _sign(self, payload):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                # yield to make interleaving likely if not serialized
+                time.sleep(0.01)
+                sig = super()._sign(payload)
+                self.active -= 1
+                return sig
+
+        signer = TrackingSigner(self.private_key)
+        n_threads = 16
+        barrier = Barrier(n_threads)
+        results = []
+        errors = []
+
+        def worker():
+            barrier.wait()
+            try:
+                results.append(signer.sign(b"DATA"))
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), n_threads)
+        self.assertEqual(signer.max_active, 1)
+        for sig in results:
+            self.assertIsInstance(sig, Signature)
+            self.assertEqual(sig.keyid, signer.public_key.keyid)
+
+    def test_signer_is_deepcopyable(self):
+        """The internal lock must not break copy/deepcopy of signers."""
+        signer = self._make_signer()
+        clone = copy.deepcopy(signer)
+
+        sig = clone.sign(b"DATA")
+        self.assertEqual(sig.keyid, clone.public_key.keyid)
+
+
 class TestGPGRSA(unittest.TestCase):
     """Test RSA gpg signature creation and verification."""
 

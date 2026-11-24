@@ -36,6 +36,7 @@ class VaultSigner(Signer):
     SCHEME = "hv"
 
     def __init__(self, hv_key_name: str, public_key: SSlibKey, hv_key_version: int):
+        super().__init__()
         if VAULT_IMPORT_ERROR:
             raise UnsupportedLibraryError(VAULT_IMPORT_ERROR)
 
@@ -47,7 +48,7 @@ class VaultSigner(Signer):
         # stable for subsequent calls to sign, also if the environment changes.
         self._client = hvac.Client()
 
-    def sign(self, payload: bytes) -> Signature:
+    def _sign(self, payload: bytes) -> Signature:
         """Signs payload with HashiCorp Vault Transit secrets engine.
 
         Arguments:

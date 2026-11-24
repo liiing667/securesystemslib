@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 from securesystemslib import exceptions
@@ -31,6 +32,19 @@ class Envelope:
         self.payload = payload
         self.payload_type = payload_type
         self.signatures = signatures
+        # Serializes sign() so that concurrent signing attempts cannot
+        # interleave and leave a half-committed signature in "signatures".
+        self._lock = threading.RLock()
+
+    def __getstate__(self) -> dict:
+        # Locks are not copyable/picklable: drop it when copying the envelope.
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
 
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, Envelope):
@@ -109,17 +123,33 @@ class Envelope:
     def sign(self, signer: Signer) -> Signature:
         """Sign the payload and create the signature.
 
+        The signature is only committed to ``self.signatures`` once the
+        signer has produced a complete :class:`Signature` for the same
+        trusted key. If signing fails, the exception propagates and the
+        envelope (including any pre-existing signatures) is left unchanged,
+        so a retry uses the same key state instead of a half-written
+        signature. Concurrent calls are serialized: each successful call
+        adds at most one signature.
+
         Arguments:
             signer: A "Signer" class instance.
 
         Returns:
             A "Signature" instance.
         """
+        with self._lock:
+            # Sign first and only commit the fully formed signature
+            # afterwards: nothing is mutated while signing may fail.
+            signature = signer.sign(self.pae())
 
-        signature = signer.sign(self.pae())
-        self.signatures[signature.keyid] = signature
+            # Build a new mapping instead of mutating the existing one, so a
+            # failure between the sign call and the assignment cannot leave a
+            # partial "Signature" behind.
+            signatures = dict(self.signatures)
+            signatures[signature.keyid] = signature
+            self.signatures = signatures
 
-        return signature
+            return signature
 
     def verify(self, keys: list[Key], threshold: int) -> dict[str, Key]:
         """Verify the payload with the provided Keys.

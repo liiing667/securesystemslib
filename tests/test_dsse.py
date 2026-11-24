@@ -1,8 +1,11 @@
 """Test cases for "metadata.py"."""
 
 import copy
+import threading
+import time
 import unittest
 from pathlib import Path
+from threading import Barrier
 
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
@@ -176,6 +179,113 @@ class TestEnvelope(unittest.TestCase):
         duplicate_keys = key_list + key_list
         with self.assertRaises(VerificationError):
             envelope_obj.verify(duplicate_keys, 4)  # 3 unique keys, threshold 4.
+
+    def test_sign_failure_does_not_leave_partial_signature(self):
+        """If signing fails, the envelope must keep its previous state.
+
+        A retry with the same trusted signer then succeeds.
+        """
+        signer = self.signers[0]
+        envelope = Envelope(b"hello world", "http://example.com/HelloWorld", {})
+
+        class FlakySigner(CryptoSigner):
+            def __init__(self, real_signer):
+                super().__init__(real_signer._private_key, real_signer.public_key)
+                self.attempts = 0
+
+            def _sign(self, payload):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RuntimeError("signer failed mid-way")
+                return super()._sign(payload)
+
+        flaky = FlakySigner(signer)
+
+        # The failing attempt must not commit a half signature.
+        with self.assertRaises(RuntimeError):
+            envelope.sign(flaky)
+        self.assertEqual(envelope.signatures, {})
+
+        # Retrying with the same trusted key commits exactly one signature.
+        signature = envelope.sign(flaky)
+        self.assertEqual(flaky.attempts, 2)
+        self.assertEqual(
+            envelope.signatures, {signer.public_key.keyid: signature}
+        )
+        envelope.verify([signer.public_key], 1)
+
+    def test_sign_failure_preserves_existing_signatures(self):
+        """Pre-existing envelope signatures survive a later failing sign."""
+        good_signer = self.signers[0]
+        failing_signer = self.signers[1]
+
+        envelope = Envelope(b"hello world", "http://example.com/HelloWorld", {})
+        first_sig = envelope.sign(good_signer)
+        state_before = copy.deepcopy(envelope.signatures)
+
+        class FailingSigner(CryptoSigner):
+            def _sign(self, payload):
+                raise RuntimeError("signer failed mid-way")
+
+        with self.assertRaises(RuntimeError):
+            envelope.sign(
+                FailingSigner(
+                    failing_signer._private_key, failing_signer.public_key
+                )
+            )
+
+        # The old signature and key state are untouched.
+        self.assertEqual(envelope.signatures, state_before)
+        self.assertEqual(
+            envelope.signatures[good_signer.public_key.keyid], first_sig
+        )
+
+    def test_concurrent_signing_each_signature_committed_once(self):
+        """Concurrent sign() calls with distinct keys all commit atomically."""
+        envelope = Envelope(b"hello world", "http://example.com/HelloWorld", {})
+
+        class SlowSigner(CryptoSigner):
+            def _sign(self, payload):
+                time.sleep(0.01)
+                return super()._sign(payload)
+
+        signers = [
+            SlowSigner(s._private_key, s.public_key) for s in self.signers
+        ]
+        barrier = Barrier(len(signers))
+        errors = []
+
+        def worker(signer):
+            barrier.wait()
+            try:
+                envelope.sign(signer)
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(s,)) for s in signers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        # exactly one complete signature per trusted key, no partial entries
+        self.assertEqual(len(envelope.signatures), len(signers))
+        self.assertEqual(
+            set(envelope.signatures),
+            {s.public_key.keyid for s in signers},
+        )
+        envelope.verify([s.public_key for s in signers], len(signers))
+
+    def test_envelope_is_deepcopyable_with_lock(self):
+        """The internal lock must not break copying the envelope."""
+        envelope = Envelope(b"hello world", "http://example.com/HelloWorld", {})
+        envelope.sign(self.signers[0])
+
+        clone = copy.deepcopy(envelope)
+        self.assertEqual(clone.signatures, envelope.signatures)
+        clone.sign(self.signers[1])
+        self.assertEqual(len(clone.signatures), 2)
 
 
 # Run the unit tests.
