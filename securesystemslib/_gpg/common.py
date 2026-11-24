@@ -25,9 +25,12 @@ import struct
 
 from securesystemslib._gpg import util as gpg_util
 from securesystemslib._gpg.constants import (
+    EMBEDDED_SIGNATURE_SUBPACKET,
     FULL_KEYID_SUBPACKET,
     GPG_HASH_ALGORITHM_STRING,
     KEY_EXPIRATION_SUBPACKET,
+    KEY_FLAG_SIGN_DATA,
+    KEY_FLAGS_SUBPACKET,
     PACKET_TYPE_PRIMARY_KEY,
     PACKET_TYPE_SIGNATURE,
     PACKET_TYPE_SUB_KEY,
@@ -41,6 +44,7 @@ from securesystemslib._gpg.constants import (
     SIG_CREATION_SUBPACKET,
     SIGNATURE_TYPE_BINARY,
     SIGNATURE_TYPE_CERTIFICATES,
+    SIGNATURE_TYPE_PRIMARY_KEY_BINDING,
     SIGNATURE_TYPE_SUB_KEY_BINDING,
     SUPPORTED_PUBKEY_PACKET_VERSIONS,
     SUPPORTED_SIGNATURE_PACKET_VERSIONS,
@@ -473,7 +477,7 @@ def _get_verified_subkeys(bundle):
 
     # Verify subkey binding signatures and only keep verified keys
     # See notes about subkey binding signature in RFC4880 5.2.3.3
-    verified_subkeys = {}
+    verified_candidates = {}
     for subkey_packet, packet_data in bundle[PACKET_TYPE_SUB_KEY].items():
         try:
             # Parse subkey if possible and skip if invalid (e.g. not-supported)
@@ -541,6 +545,27 @@ def _get_verified_subkeys(bundle):
             )
             continue
 
+        # A signing-capable subkey must also carry a valid embedded primary key
+        # binding signature (often called a back/cross signature). It proves that
+        # the subkey participates in the binding and prevents a public subkey
+        # from being attached to another primary key without its own proof.
+        key_flags_data = signature["info"]["subpackets"].get(KEY_FLAGS_SUBPACKET)
+        key_flags = key_flags_data[0] if key_flags_data else None
+        signing_capable = (
+            bool(key_flags & KEY_FLAG_SIGN_DATA) if key_flags is not None else None
+        )
+        cross_signature_valid = _verify_primary_key_binding_signature(
+            signature, subkey, signed_content
+        )
+
+        if signing_capable is True and not cross_signature_valid:
+            log.info(
+                "Ignoring signing-capable subkey '%s' due to missing or invalid "
+                "embedded primary key binding signature.",
+                subkey["keyid"],
+            )
+            continue
+
         # If the signature is valid, we may also extract relevant information from
         # its "info" field (e.g. subkey expiration date) and assign to it to the
         # subkey here
@@ -548,9 +573,86 @@ def _get_verified_subkeys(bundle):
         if validity_period is not None:
             subkey["validity_period"] = struct.unpack(">I", validity_period)[0]
 
-        verified_subkeys[subkey["keyid"]] = subkey
+        # Explicit provenance markers let the public verifier distinguish a
+        # subkey published by this authenticated bundle parser from an arbitrary
+        # dictionary inserted by a caller. They are attestations about the
+        # in-memory bundle view, not cryptographic fields of the key itself.
+        subkey["key_flags"] = key_flags
+        subkey["signing_capable"] = signing_capable
+        subkey["cross_binding_verified"] = cross_signature_valid
+        subkey["binding_verified"] = True
+
+        verified_candidates.setdefault(subkey["keyid"], []).append(subkey)
+
+    # Publish a keyid only when all valid bindings describe the same key view.
+    # Building the result after packet processing prevents a failed or ambiguous
+    # certificate from partially overwriting a published keyring entry.
+    verified_subkeys = {}
+    for keyid, candidates in verified_candidates.items():
+        candidate = candidates[0]
+        if any(other != candidate for other in candidates[1:]):
+            log.info(
+                "Ignoring ambiguous subkey keyid '%s': %d distinct certificate "
+                "views claim the same keyid.",
+                keyid,
+                len(candidates),
+            )
+            continue
+
+        verified_subkeys[keyid] = candidate
 
     return verified_subkeys
+
+
+def _verify_primary_key_binding_signature(
+    binding_signature, subkey, signed_content
+):
+    """Verify an embedded primary key binding (back/cross) signature."""
+    embedded_data = binding_signature["info"]["subpackets"].get(
+        EMBEDDED_SIGNATURE_SUBPACKET
+    )
+    if embedded_data is None:
+        return False
+
+    # Embedded signature subpacket data is a signature packet body. Prefix an
+    # old-format packet tag and a four-octet length so the packet parser can
+    # parse it with the ordinary signature packet entry point.
+    embedded_packet = (
+        b"\x8a" + struct.pack(">I", len(embedded_data)) + bytes(embedded_data)
+    )
+
+    try:
+        embedded_signature = parse_signature_packet(
+            embedded_packet,
+            supported_hash_algorithms={SHA1, SHA256, SHA512},
+            supported_signature_types={SIGNATURE_TYPE_PRIMARY_KEY_BINDING},
+            include_info=True,
+        )
+        issuer_keyid = embedded_signature["keyid"] or embedded_signature.get(
+            "short_keyid", ""
+        )
+    except Exception as e:
+        log.info("Ignoring malformed embedded primary key binding: %s", e)
+        return False
+
+    if not issuer_keyid or not subkey["keyid"].endswith(issuer_keyid.lower()):
+        log.info(
+            "Embedded primary key binding for '%s' was not issued by subkey.",
+            subkey["keyid"],
+        )
+        return False
+
+    subkey_handler = SIGNATURE_HANDLERS[subkey["type"]]
+    try:
+        return subkey_handler.verify_signature(
+            embedded_signature,
+            subkey,
+            signed_content,
+            embedded_signature["info"]["hash_algorithm"],
+        )
+    except Exception as e:
+        log.info("Invalid embedded primary key binding: %s", e)
+        return False
 
 
 def get_pubkey_bundle(data, keyid):
@@ -602,29 +704,42 @@ def get_pubkey_bundle(data, keyid):
     master_public_key = _assign_certified_key_info(raw_key_bundle)
     sub_public_keys = _get_verified_subkeys(raw_key_bundle)
 
-    # Since GPG returns all pubkeys associated with a keyid (master key and
-    # subkeys) we check which key matches the passed keyid.
-    # If the matching key is a subkey, we warn the user because we return
-    # the whole bundle (master plus all subkeys) and not only the subkey.
-    # If no matching key is found we raise a KeyNotFoundError.
-    for idx, public_key in enumerate(
-        [master_public_key] + list(sub_public_keys.values())
-    ):
-        if public_key and public_key["keyid"].endswith(keyid.lower()):
-            if idx > 1:
-                log.debug(
-                    "Exporting master key '{}' including subkeys '{}' for"
-                    " passed keyid '{}'.".format(
-                        master_public_key["keyid"],
-                        ", ".join(list(sub_public_keys.keys())),
-                        keyid,
-                    )
-                )
-            break
+    # Require a unique key identity. GPG export can contain several certificate
+    # views claiming the same keyid (for example stale or cross-signed
+    # material); selecting the last dictionary entry would make verification
+    # depend on packet order. Exact fingerprints are preferred, while suffix
+    # matching retains compatibility with long/short keyids.
+    wanted_keyid = str(keyid).lower()
+    candidate_keys = [master_public_key, *sub_public_keys.values()]
+    matching_keys = [
+        public_key
+        for public_key in candidate_keys
+        if public_key
+        and (
+            public_key["keyid"].lower() == wanted_keyid
+            or public_key["keyid"].lower().endswith(wanted_keyid)
+        )
+    ]
 
-    else:
+    if not matching_keys:
         raise KeyNotFoundError(
             f"Could not find gpg key '{keyid}' in exported key data."
+        )
+
+    if len(matching_keys) > 1:
+        matching_keyids = ", ".join(key["keyid"] for key in matching_keys)
+        raise KeyNotFoundError(
+            f"GPG keyid '{keyid}' is not unique in exported key data; "
+            f"matching identities: {matching_keyids}."
+        )
+
+    if matching_keys[0] is not master_public_key:
+        log.debug(
+            "Exporting master key '%s' including subkeys '%s' for passed "
+            "keyid '%s'.",
+            master_public_key["keyid"],
+            ", ".join(sub_public_keys.keys()),
+            keyid,
         )
 
     # Add subkeys dictionary to master pubkey "subkeys" field if subkeys exist
@@ -691,9 +806,15 @@ def parse_signature_packet(
     if not supported_hash_algorithms:
         supported_hash_algorithms = {SHA256}
 
-    _, header_len, _, packet_len = gpg_util.parse_packet_header(
-        data, PACKET_TYPE_SIGNATURE
-    )
+    if not data:
+        raise ValueError("Cannot parse an empty GPG signature packet.")
+
+    try:
+        _, header_len, _, packet_len = gpg_util.parse_packet_header(
+            data, PACKET_TYPE_SIGNATURE
+        )
+    except (PacketParsingError, IndexError, struct.error) as e:
+        raise ValueError(f"Invalid GPG signature packet: {e}") from e
 
     data = bytearray(data[header_len:packet_len])
 

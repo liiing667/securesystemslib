@@ -46,6 +46,94 @@ log = logging.getLogger(__name__)
 NO_CRYPTO_MSG = "GPG support requires the cryptography library"
 
 
+def _keyid_matches(candidate_keyid, signature_keyid):
+    """Return True for an exact keyid or a compatible keyid suffix."""
+    if not candidate_keyid or not signature_keyid:
+        return False
+
+    candidate_keyid = str(candidate_keyid).lower()
+    signature_keyid = str(signature_keyid).lower()
+    return candidate_keyid == signature_keyid or candidate_keyid.endswith(
+        signature_keyid
+    )
+
+
+def _trusted_bundle_subkey(subkey_info, sig_keyid):
+    """Apply bundle provenance policy to a matched subkey."""
+    if subkey_info.get("binding_verified") is not True:
+        log.info(
+            "Refusing subkey '%s' without a verified primary binding.",
+            sig_keyid,
+        )
+        return None
+
+    if subkey_info.get("signing_capable") is False:
+        log.info(
+            "Refusing signature by subkey '%s' whose key flags do not allow "
+            "signing.",
+            sig_keyid,
+        )
+        return None
+
+    if subkey_info.get("cross_binding_verified") is not True:
+        log.info(
+            "Refusing signing subkey '%s' without a verified embedded primary "
+            "key binding.",
+            sig_keyid,
+        )
+        return None
+
+    return subkey_info
+
+
+def _select_verification_key(pubkey_info, sig_keyid):
+    """Resolve a signature issuer to one trusted primary or bundle subkey."""
+    primary_matches = _keyid_matches(pubkey_info.get("keyid"), sig_keyid)
+    matching_subkeys = []
+
+    for subkey_keyid, subkey_info in pubkey_info.get("subkeys", {}).items():
+        if not isinstance(subkey_info, dict):
+            continue
+
+        # The dictionary index and parsed key identity must agree. This keeps a
+        # stale map entry from publishing one key while its material claims
+        # another keyid.
+        if _keyid_matches(subkey_keyid, sig_keyid) and _keyid_matches(
+            subkey_info.get("keyid"), sig_keyid
+        ):
+            matching_subkeys.append(subkey_info)
+
+    if primary_matches and matching_subkeys:
+        log.info(
+            "GPG keyid '%s' matches both primary and subkey material; "
+            "refusing ambiguous identity.",
+            sig_keyid,
+        )
+        return None
+
+    if len(matching_subkeys) > 1:
+        log.info(
+            "GPG keyid '%s' matches %d subkeys; refusing ambiguous identity.",
+            sig_keyid,
+            len(matching_subkeys),
+        )
+        return None
+
+    if primary_matches:
+        # A top-level public key remains an explicitly supplied trust anchor,
+        # including a standalone subkey represented in this legacy format.
+        return pubkey_info
+
+    if not matching_subkeys:
+        log.info(
+            "GPG signature issuer '%s' is not bound to the passed public key.",
+            sig_keyid,
+        )
+        return None
+
+    return _trusted_bundle_subkey(matching_subkeys[0], sig_keyid)
+
+
 def _homedir_to_gpg_arg(homedir: str) -> str:
     """Convert a homedir path to a GPG-compatible --homedir argument.
 
@@ -204,7 +292,7 @@ def verify_signature(signature_object, pubkey_info, content):
     """
     <Purpose>
       Verifies the passed signature against the passed content using the
-      passed public key, or one of its subkeys, associated by the signature's
+      unique primary or proven-bound subkey associated with the signature's
       keyid.
 
       The function selects the appropriate verification algorithm (rsa or dsa)
@@ -232,20 +320,33 @@ def verify_signature(signature_object, pubkey_info, content):
 
     <Returns>
       True if signature verification passes, False otherwise.
+      False is also returned if the issuer keyid is missing, ambiguous, not
+      present in ``pubkey_info``, or names a subkey whose bundle binding has
+      not been verified. An expired but otherwise valid key raises
+      KeyExpirationError.
 
     """
     if not CRYPTO:  # pragma: no cover
         raise exceptions.UnsupportedLibraryError(NO_CRYPTO_MSG)
 
-    handler = SIGNATURE_HANDLERS[pubkey_info["type"]]
-    sig_keyid = signature_object["keyid"]
+    if not isinstance(signature_object, dict) or not isinstance(
+        pubkey_info, dict
+    ):
+        log.info("Refusing GPG verification with malformed key or signature.")
+        return False
 
-    verification_key = pubkey_info
+    sig_keyid = signature_object.get("keyid") or signature_object.get(
+        "short_keyid"
+    )
+    if not sig_keyid:
+        log.info("Refusing GPG verification without a signature issuer keyid.")
+        return False
 
-    # If the keyid on the signature matches a subkey of the passed key,
-    # we use that subkey for verification instead of the master key.
-    if sig_keyid in list(pubkey_info.get("subkeys", {}).keys()):
-        verification_key = pubkey_info["subkeys"][sig_keyid]
+    # Resolve the issuer to exactly one proven primary or subkey identity. An
+    # unknown keyid must not fall through to verification with the primary key.
+    verification_key = _select_verification_key(pubkey_info, sig_keyid)
+    if verification_key is None:
+        return False
 
     creation_time = verification_key.get("creation_time")
     validity_period = verification_key.get("validity_period")
@@ -257,6 +358,9 @@ def verify_signature(signature_object, pubkey_info, content):
     ):
         raise KeyExpirationError(verification_key)
 
+    # The primary and a subkey may use different public-key algorithms. Select
+    # the handler from the key material that will actually verify the signature.
+    handler = SIGNATURE_HANDLERS[verification_key["type"]]
     return handler.verify_signature(signature_object, verification_key, content, SHA256)
 
 
