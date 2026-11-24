@@ -65,6 +65,51 @@ class TestFormats(unittest.TestCase):
             {"x": securesystemslib.exceptions.FormatError},
         )
 
+    def test_encode_canonical_normalizes_unicode(self):
+        """Canonically equivalent Unicode spellings share one encoding."""
+        encode = securesystemslib.formats.encode_canonical
+
+        # Precomposed and decomposed forms of "é" must produce the same bytes.
+        self.assertEqual(
+            encode({"name": "\u00e9"}),
+            encode({"name": "e\u0301"}),
+        )
+
+        # The same holds for keys, including their sort position.
+        self.assertEqual(
+            encode({"\u00e9": 1, "z": 2}),
+            encode({"e\u0301": 1, "z": 2}),
+        )
+
+        # Distinct keys that normalize to the same key are ambiguous, not
+        # silently emitted twice.
+        self.assertRaises(
+            securesystemslib.exceptions.FormatError,
+            encode,
+            {"\u00e9": 1, "e\u0301": 2},
+        )
+
+        # The result must be representable as UTF-8.
+        self.assertRaises(
+            securesystemslib.exceptions.FormatError,
+            encode,
+            "\ud800",
+        )
+
+    def test_encode_canonical_publishes_one_complete_result(self):
+        """The sink receives exactly one result, and never a partial one."""
+        encode = securesystemslib.formats.encode_canonical
+        emitted = []
+
+        # A failure halfway through must not leak a partial object.
+        with self.assertRaises(securesystemslib.exceptions.FormatError):
+            encode([1, 2.0, 3], emitted.append)
+        self.assertEqual([], emitted)
+
+        # The next object is encoded cleanly into the same sink.
+        encode([1, 2, 3], emitted.append)
+        self.assertEqual(["[1,2,3]"], emitted)
+
 
 # Run unit test.
 if __name__ == "__main__":

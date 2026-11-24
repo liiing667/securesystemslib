@@ -20,6 +20,7 @@
 
 """
 
+import unicodedata
 from collections.abc import Callable
 
 from securesystemslib import exceptions
@@ -32,6 +33,11 @@ def _canonical_string_encoder(string: str) -> str:
       which is mandatory to use for quote and backslash. 
       backslash: \\ translates to \\\\ 
       quote: \" translates to \\".
+
+      The string is first normalized to Unicode NFC. Canonically equivalent
+      spellings (e.g. a precomposed 'é' and a decomposed 'e' followed by a
+      combining acute accent) must therefore produce exactly the same
+      canonical bytes, so that all consumers compute the same digest.
 
     <Arguments>
       string:
@@ -46,6 +52,12 @@ def _canonical_string_encoder(string: str) -> str:
     <Returns>
       A string with the canonical-encoded 'string' embedded.
     """
+    if not isinstance(string, str):
+        raise exceptions.FormatError(
+            "Canonical JSON strings must be str, not " + type(string).__name__
+        )
+
+    string = unicodedata.normalize("NFC", string)
     string = '"{}"'.format(string.replace("\\", "\\\\").replace('"', '\\"'))
 
     return string
@@ -76,15 +88,39 @@ def _encode_canonical(
             _encode_canonical(object[-1], output_function)
         output_function("]")
     elif isinstance(object, dict):
+        # Normalize keys before sorting so that Unicode-equivalent spellings
+        # sort and encode identically. Distinct keys that collapse to the same
+        # normalized key would result in ambiguous duplicate JSON keys, so
+        # reject them instead of publishing an ambiguous byte sequence.
+        normalized_items: list[tuple[str, object]] = []
+        seen_keys: set[str] = set()
+        for key, value in object.items():
+            if not isinstance(key, str):
+                raise exceptions.FormatError(
+                    "Canonical JSON object keys must be strings, not "
+                    + type(key).__name__
+                )
+
+            normalized_key = unicodedata.normalize("NFC", key)
+            if normalized_key in seen_keys:
+                raise exceptions.FormatError(
+                    "Canonical JSON object contains duplicate keys after "
+                    "Unicode normalization: " + repr(normalized_key)
+                )
+
+            seen_keys.add(normalized_key)
+            normalized_items.append((normalized_key, value))
+
+        normalized_items.sort(key=lambda item: item[0])
+
         output_function("{")
-        if len(object):
-            items = sorted(object.items())
-            for key, value in items[:-1]:
+        if normalized_items:
+            for key, value in normalized_items[:-1]:
                 output_function(_canonical_string_encoder(key))
                 output_function(":")
                 _encode_canonical(value, output_function)
                 output_function(",")
-            key, value = items[-1]
+            key, value = normalized_items[-1]
             output_function(_canonical_string_encoder(key))
             output_function(":")
             _encode_canonical(value, output_function)
@@ -111,6 +147,15 @@ def encode_canonical(
       and the resulting bits are passed to output_function (if provided),
       or joined into a string and returned.
 
+      Strings and object keys are normalized to Unicode NFC before encoding,
+      so canonically equivalent Unicode spellings produce one canonical byte
+      sequence (and therefore one digest) on every platform.  Keys that only
+      become equal after normalization are rejected as ambiguous duplicates.
+
+      The complete result is built before it is published: it is passed to
+      'output_function' exactly once, and a failed encoding never emits a
+      partial result that could leak into the next object.
+
       Note: This function should be called prior to computing the hash or
       signature of a JSON object in securesystemslib.  For example, generating a
       signature of a signing role object such as 'ROOT_SCHEMA' is required to
@@ -130,6 +175,8 @@ def encode_canonical(
       '{"A":[99]}'
       >>> encode_canonical({"x" : 3, "y" : 2})
       '{"x":3,"y":2}'
+      >>> encode_canonical({"name": "e\\u0301"}) == encode_canonical({"name": "\u00e9"})
+      True
 
     <Arguments>
       object:
@@ -144,29 +191,40 @@ def encode_canonical(
       'output_function' is not callable.
 
     <Side Effects>
-      The results are fed to 'output_function()' if 'output_function' is set.
+      The complete result is fed to 'output_function()' once, if
+      'output_function' is set.
 
     <Returns>
       A string representing the 'object' encoded in canonical JSON form.
     """
 
-    result: None | list = None
-    # If 'output_function' is unset, treat it as
-    # appending to a list.
-    if output_function is None:
-        result = []
-        output_function = result.append
+    if output_function is not None and not callable(output_function):
+        raise exceptions.FormatError(
+            "Could not encode " + repr(object) + ": 'output_function' is not callable"
+        )
 
+    # Encode into a private buffer first.  The caller-provided sink is only
+    # touched once the object has been encoded completely, so an error halfway
+    # through cannot leave a truncated result behind for the next object.
+    result: list[str] = []
     try:
-        _encode_canonical(object, output_function)
+        _encode_canonical(object, result.append)
+        encoded: str = "".join(result)
 
-    except (TypeError, exceptions.FormatError) as e:
+        # Fail closed if the canonical text cannot be represented as UTF-8
+        # (e.g. it contains an unpaired surrogate).  This keeps the public
+        # output a single, well-defined byte domain.
+        encoded.encode("utf-8")
+
+    except (TypeError, ValueError, UnicodeError, exceptions.FormatError) as e:
         message: str = "Could not encode " + repr(object) + ": " + str(e)
-        raise exceptions.FormatError(message)
+        raise exceptions.FormatError(message) from e
 
     # Return the encoded 'object' as a string.
     # Note: Implies 'output_function' is None,
-    # otherwise results are sent to 'output_function'.
-    if result is not None:
-        return "".join(result)
+    # otherwise the single complete result is sent to 'output_function'.
+    if output_function is None:
+        return encoded
+
+    output_function(encoded)
     return None
