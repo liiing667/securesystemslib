@@ -56,9 +56,27 @@ def b64dec(string: str) -> bytes:
         A byte sequence
     """
 
-    data = string.encode("utf-8")
+    if not isinstance(string, str):
+        raise ValueError("base64 input must be a string")
+
     try:
-        return base64.b64decode(data, validate=True)
+        data = string.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise binascii.Error("base64 strings must be ASCII") from exc
+
+    try:
+        decoded = base64.b64decode(data, validate=True)
     except binascii.Error:
         # altchars for urlsafe encoded base64 - instead of + and _ instead of /
-        return base64.b64decode(data, altchars=b"-_", validate=True)
+        decoded = base64.b64decode(data, altchars=b"-_", validate=True)
+        canonical = base64.urlsafe_b64encode(decoded)
+    else:
+        canonical = base64.standard_b64encode(decoded)
+
+    # Reject missing/surplus padding, whitespace and non-zero ignored tail
+    # bits.  Each supported alphabet therefore accepts only its canonical
+    # encoding for the decoded byte sequence.
+    if data != canonical:
+        raise binascii.Error("Non-canonical base64 encoding")
+
+    return decoded

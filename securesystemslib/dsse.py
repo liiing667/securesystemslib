@@ -73,8 +73,15 @@ class Envelope:
 
         signatures = {}
         for signature in data["signatures"]:
-            signature["sig"] = b64dec(signature["sig"]).hex()
-            sig = Signature.from_dict(signature)
+            if not isinstance(signature, dict):
+                raise ValueError("DSSE signatures must be dictionaries")
+
+            # Decode into a local dictionary.  The caller's envelope data is
+            # not mutated and a bad later signature cannot leave an earlier
+            # signature dictionary half-converted or emptied by pop().
+            signature_input = dict(signature)
+            signature_input["sig"] = b64dec(signature["sig"]).hex()
+            sig = Signature.from_dict(signature_input)
             if sig.keyid in signatures:
                 raise ValueError(f"Multiple signatures found for keyid {sig.keyid}")
             signatures[sig.keyid] = sig
